@@ -50,9 +50,12 @@ module Github
         DUPLICATE_H1 = %r{(<p class="page" id="[^"]*"></p>)<h1>([^<]*)</h1>(\s*<!-- generated-by: bin/wiki-gen -->\s*<h1 id="[^"]*">)\2(</h1>)}
 
         HEAD_MARKER = "<!-- github-wiki-pub:head -->"
+        HEAD_END_MARKER = "<!-- /github-wiki-pub:head -->"
         SCRIPT_MARKER = "<!-- github-wiki-pub:mermaid -->"
 
-        # Blocks injected by this tool, or by the wiki-html-polish.rb script it replaces.
+        # The head block this tool injects, and older forms of it that ended at
+        # </style>: from before the end marker, or from wiki-html-polish.rb.
+        HEAD_BLOCK = /#{Regexp.escape(HEAD_MARKER)}.*?#{Regexp.escape(HEAD_END_MARKER)}\n/m
         OLD_HEAD = %r{<!-- (?:github-wiki-pub|wiki-html-polish):head -->.*?</style>\n}m
         OLD_SCRIPT = %r{(?:#{Regexp.escape(SCRIPT_MARKER)}\n)?<script type="module">\s*import mermaid .*?</script>\n?}m
 
@@ -115,7 +118,7 @@ module Github
         end
 
         def inject_styles(html)
-          html.sub(OLD_HEAD, "").sub("</head>", "#{head_assets}</head>")
+          html.sub(HEAD_BLOCK, "").sub(OLD_HEAD, "").sub("</head>", "#{head_assets}</head>")
         end
 
         def inject_mermaid_script(html)
@@ -152,7 +155,51 @@ module Github
             .admonition-warning { border-color: #9a6700; background: #fff8c5; } .admonition-warning .admonition-title { color: #9a6700; }
             .admonition-caution { border-color: #cf222e; background: #ffebe9; } .admonition-caution .admonition-title { color: #cf222e; }
             pre.mermaid { background: transparent; border: 0; text-align: center; }
+            /* Phones and tablets: content takes the full width, and the sidebar
+               becomes a scrollable dropdown under the hamburger button. */
+            @media (max-width: 991px) {
+              body { padding-left: 0; padding-right: 0; }
+              .container { width: 100% !important; }
+              .navbar-header { float: none; }
+              .navbar-toggle { display: block !important; }
+              #navbar { display: none !important; }
+              #documentation-container > .row > .col-md-9 { width: 100%; padding-left: 15px; padding-right: 15px; }
+              #documentation-container > .row > .col-md-3 {
+                display: none; position: fixed; top: 51px; left: 0; right: 0; z-index: 1029;
+                max-height: calc(100vh - 51px); overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+                padding: 10px 15px 20px; background: #fff; border-bottom: 1px solid #ddd; box-shadow: 0 10px 24px rgba(0, 0, 0, .15);
+              }
+              body.gwp-nav-open #documentation-container > .row > .col-md-3 { display: block; }
+              body.gwp-nav-open { overflow: hidden; }
+              .html-doc .nav-container > .nav-inner { position: static !important; width: auto !important; min-width: 0 !important; overflow: visible !important; }
+            }
             </style>
+            <script>
+            /* The hamburger opens the sidebar as a dropdown; picking a page closes it. */
+            document.addEventListener("DOMContentLoaded", function () {
+              var button = document.querySelector(".navbar-toggle");
+              var sidebar = document.querySelector("#documentation-container > .row > .col-md-3");
+              if (!button || !sidebar) return;
+              button.removeAttribute("data-toggle"); /* keep Bootstrap's collapse off it */
+              button.removeAttribute("data-target");
+              function setOpen(open) {
+                document.body.classList.toggle("gwp-nav-open", open);
+                button.classList.toggle("collapsed", !open);
+                button.setAttribute("aria-expanded", String(open));
+              }
+              button.addEventListener("click", function (event) {
+                event.preventDefault();
+                setOpen(!document.body.classList.contains("gwp-nav-open"));
+              });
+              sidebar.addEventListener("click", function (event) {
+                if (event.target.closest("a")) setOpen(false);
+              });
+              window.addEventListener("resize", function () {
+                if (window.innerWidth >= 992) setOpen(false);
+              });
+            });
+            </script>
+            #{HEAD_END_MARKER}
           HTML
         end
 
