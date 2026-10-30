@@ -99,6 +99,14 @@ RSpec.describe Github::Wiki::Pub::HtmlCleaner do
         .and include("width: calc(19vw - 15px) !important;")
     end
 
+    it "gives phones full-width content and a hamburger dropdown for the sidebar" do
+      expect(html).to include("@media (max-width: 991px)")
+        .and include(".navbar-toggle { display: block !important; }")
+        .and include("body.gwp-nav-open #documentation-container > .row > .col-md-3 { display: block; }")
+        .and include("max-height: calc(100vh - 51px); overflow-y: auto;")
+        .and include(%q{button.removeAttribute("data-toggle")})
+    end
+
     context "with custom sizes and font" do
       let(:options) { { page_width: 90, nav_width: 25, content_padding: 12, font: "Open Sans" } }
 
@@ -121,7 +129,8 @@ RSpec.describe Github::Wiki::Pub::HtmlCleaner do
 
     it "replaces its own styles and script when settings change", :aggregate_failures do
       again = described_class.new(page_width: 80, mermaid_version: 11).clean(html).html
-      expect(again.scan("github-wiki-pub:head").size).to eq(1)
+      expect(again.scan("<!-- github-wiki-pub:head -->").size).to eq(1)
+      expect(again.scan("gwp-nav-open\", open)").size).to eq(1)
       expect(again.scan("mermaid.initialize").size).to eq(1)
       expect(again).to include("width: 80% !important").and include("mermaid@11")
     end
@@ -129,6 +138,11 @@ RSpec.describe Github::Wiki::Pub::HtmlCleaner do
     it "replaces the head block written by wiki-html-polish.rb" do
       legacy = WikiHtml::DOCUMENT.sub("</head>", "<!-- wiki-html-polish:head -->\n<style>\nold\n</style>\n</head>")
       expect(cleaner.clean(legacy).html).not_to include("wiki-html-polish")
+    end
+
+    it "replaces its own older head block, which ended at </style>" do
+      older = WikiHtml::DOCUMENT.sub("</head>", "<!-- github-wiki-pub:head -->\n<style>\nold\n</style>\n</head>")
+      expect(cleaner.clean(older).html).not_to include("<style>\nold\n")
     end
   end
 
