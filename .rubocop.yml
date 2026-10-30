@@ -1,0 +1,23 @@
+inherit_from:
+- https://relaxed.ruby.style/rubocop.yml
+
+AllCops:
+  NewCops: enable
+  SuggestExtensions: false
+  TargetRubyVersion: 4.0
+  Exclude:
+  - 'lib/dry-cli-help.rb'
+  - 'vendor/**/*'
+  - 'bin/**/*'
+  - 'tmp/**/*'
+  - 'spec/**/*'
+
+Layout/LineLength:
+  Max: 100
+
+Metrics/BlockLength:
+  Exclude:
+    - "spec/**/*"
+
+Lint/ConstantDefinitionInBlock:
+  Enabled: false

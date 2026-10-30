@@ -1,0 +1,827 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/wiki-gen — Generate this repo's wiki repository.
+#
+# The wiki is DERIVED, never hand-written. Two kinds of input feed it:
+#
+# The page hierarchy lives in bin/wiki_gen/pages.rb (`SECTIONS`). Sections
+# claim documents by glob, so a new file under docs/usage/ appears on the next
+# run with no code change. A document under docs/ that no section claims still
+# gets a page, under "Other Documents", and is flagged on Documentation Drift.
+#
+# Relative links inside a lifted document are resolved against THAT document's
+# directory. A link to another lifted document becomes a wiki link; anything
+# else becomes an absolute link into the repository at --ref.
+#
+# Usage:
+#   bin/wiki-gen                     # regenerate wiki/ in the repository
+#   bin/wiki-gen --out DIR           # write somewhere else (bin/wiki-publish uses a .wiki clone)
+#   bin/wiki-gen --link-style wiki   # extension-less links (GitHub Wiki)
+#   bin/wiki-gen --link-style repo   # .md links (browsing wiki/ in the repo)
+#   bin/wiki-gen --ref BRANCH        # source links point at BRANCH, not main
+#   bin/wiki-gen --check             # regenerate into a temp dir and diff
+#
+# Idempotent: every emitted file carries a generator marker, and files bearing
+# that marker are removed before the run so deleted pages do not linger.
+#
+
+require 'date'
+require 'fileutils'
+require 'json'
+require 'optparse'
+require 'pathname'
+require 'set'
+require 'shellwords'
+require 'tmpdir'
+require 'uri'
+require 'yaml'
+
+module WikiGen
+  VERSION = '2.0.0'
+  ROOT = File.expand_path('..', __dir__)
+  REPO = File.read(File.join(ROOT, '.git/config'))[/^github\.com\/([^\/]+)\//, 1]
+  pp REPO
+  exit 1
+  # Source links point at this ref. `main` is right for a published wiki; pass
+  # --ref <branch> when previewing a wiki generated from unmerged work, or the
+  # links will 404 until the branch lands.
+  DEFAULT_REF = 'main'
+  MARKER = '<!-- generated-by: bin/wiki-gen -->'
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Repository access
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # Thin read-only view of the repository. Every path is repo-relative so that
+  # source links and file reads cannot disagree about what was read.
+  class Repo
+    attr_reader :root
+
+    def initialize(root) = @root = root
+
+    def abs(rel) = File.join(@root, rel)
+    def exist?(rel) = File.exist?(abs(rel))
+    def file?(rel) = File.file?(abs(rel))
+    def directory?(rel) = File.directory?(abs(rel))
+    def read(rel) = file?(rel) ? File.read(abs(rel)) : nil
+    def lines(rel) = read(rel).to_s.lines
+
+    # @param pattern [String] glob relative to the repo root
+    # @return [Array<String>] matching repo-relative paths, sorted
+    def glob(pattern)
+      Dir.glob(File.join(@root, pattern))
+         .sort
+         .map { |p| p.delete_prefix("#{@root}/") }
+    end
+
+    def dirs(pattern) = glob(pattern).select { |p| File.directory?(abs(p)) }
+
+    # Repo-relative path with symlinks resolved, so `docs/language/current/x.md`
+    # and `docs/language/v0.9/x.md` are recognised as one document.
+    def canonical(rel)
+      real = File.realpath(abs(rel))
+      root = File.realpath(@root)
+      real.start_with?("#{root}/") ? real.delete_prefix("#{root}/") : rel
+    rescue Errno::ENOENT
+      rel
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Markdown helpers
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # Section extraction over a markdown document. Lifting a named section keeps
+  # the wiki honest: edit the source heading's body and the wiki follows.
+  class Doc
+    attr_reader :path
+
+    def initialize(text, path)
+      @text = text.to_s
+      @path = path
+    end
+
+    def empty? = @text.strip.empty?
+
+    # YAML front matter, or an empty hash. Never raises: a malformed block is
+    # treated as absent rather than taking the whole run down.
+    def front_matter
+      @front_matter ||= begin
+        m = @text.match(/\A---\s*\n(.*?)\n---\s*\n/m)
+        m ? (YAML.safe_load(m[1], permitted_classes: [Date]) || {}) : {}
+      rescue Psych::Exception
+        {}
+      end
+    end
+
+    # The document without its front matter.
+    def body
+      @text.sub(/\A---\s*\n.*?\n---\s*\n/m, '')
+    end
+
+    # The first H1, outside code fences.
+    def title
+      found = headings.find { |(level, _t, _i)| level == 1 }
+      found && found[1]
+    end
+
+    # The document without front matter and without its first H1 — the page
+    # renders the title itself.
+    def body_without_title
+      lines = body.lines
+      idx = Doc.new(body, @path).headings.find { |(l, _t, _i)| l == 1 }&.last
+      lines.delete_at(idx) if idx
+      lines.join.strip
+    end
+
+    # Headings, ignoring anything inside a fenced code block — a shell comment
+    # such as `# db:create` is not a heading, and treating it as one silently
+    # truncates the lifted section at that line.
+    #
+    # @return [Array<Array(Integer, String, Integer)>] level, title, line index
+    def headings
+      @headings ||= begin
+        fence = nil
+        @text.lines.each_with_index.filter_map do |line, i|
+          if (m = line.match(/\A\s{0,3}(`{3,}|~{3,})/))
+            if fence.nil?
+              fence = m[1][0]
+              next
+            elsif m[1][0] == fence
+              fence = nil
+              next
+            end
+          end
+          next if fence
+          next unless (m2 = line.match(/\A(\#{1,6})\s+(.*?)\s*\z/))
+
+          [m2[1].length, m2[2], i]
+        end
+      end
+    end
+
+    # Body of the first heading whose title matches +pattern+, up to the next
+    # heading of the same or a higher level.
+    #
+    # @param pattern [Regexp, String]
+    # @return [String, nil]
+    def section(pattern)
+      rx = pattern.is_a?(Regexp) ? pattern : /#{Regexp.escape(pattern)}/
+      found = headings.find { |(_l, title, _i)| title.match?(rx) }
+      return nil unless found
+
+      level, _title, index = found
+      all = @text.lines
+      stop = all.length
+      headings.each do |(l, _t, i)|
+        next if i <= index
+
+        if l <= level
+          stop = i
+          break
+        end
+      end
+      all[(index + 1)...stop].join.strip
+    end
+  end
+
+  module Text
+    module_function
+
+    # Shift every ATX heading in +md+ down by +by+ levels, so a lifted section
+    # nests correctly under the page's own headings.
+    def demote(md, by: 1)
+      return nil if md.nil?
+
+      in_fence = false
+      md.lines.map do |line|
+        in_fence = !in_fence if line.lstrip.start_with?('```', '~~~')
+        if !in_fence && (m = line.match(/\A(\#{1,6})(\s+.*)\z/))
+          "#{'#' * (m[1].length + by).clamp(1, 6)}#{m[2]}"
+        else
+          line
+        end
+      end.join
+    end
+
+    # Collapse a paragraph into a table cell: whole sentences up to a readable
+    # length. Sentences shorter than +floor+ are joined with the next one.
+    def first_sentence(text, limit: 240, floor: 60)
+      flat = text.to_s.gsub(/\s+/, ' ').strip
+      out = +''
+      flat.scan(/.*?\.(?=\s|\z)|.+\z/) do |s|
+        out << s
+        break if out.length >= floor
+      end
+      out = flat if out.strip.empty?
+      if out.length > limit
+        out = out[0, limit].sub(/\s+\S*\z/, '')
+        out << '`' if out.count('`').odd?
+        out << '…'
+      end
+      out.strip.gsub('|', '\\|')
+    end
+
+    def escape_cell(text) = text.to_s.gsub(/\s+/, ' ').strip.gsub('|', '\\|')
+
+    # Source documents attribute decisions to people by first name. The wiki is
+    # a shareable artefact, so attributions are rendered by ROLE instead. This
+    # runs over every assembled page, which also covers text lifted verbatim.
+    PEOPLE = {
+      /\bKonstantin Gredeskoul\b/ => 'the CTO',
+      /\bKonstantin\b/ => 'CTO',
+      /\bEllen Bond\b/ => 'the EA',
+      /\bElena Bondarchuk\b/ => 'the EA'
+    }.freeze
+
+    def depersonalize(text)
+      PEOPLE.reduce(text.to_s) { |acc, (rx, role)| acc.gsub(rx, role) }
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Scanners — facts read out of the tree, not out of prose
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # One `.plans/NNN.MM-<emoji> → slug` folder.
+  Plan = Struct.new(:number, :emoji, :slug, :dir, :title, :files, :prs, keyword_init: true)
+
+  # One row of the states table in .plans/README.md.
+  State = Struct.new(:emoji, :name, :key, :files, :description, keyword_init: true)
+
+  # Reads the `.plans/` archive: the state vocabulary, folder status, titles,
+  # and the per-folder pull-request tables.
+  class PlansScanner
+    def initialize(repo) = @repo = repo
+
+    # The state vocabulary, parsed from the "The states" table in
+    # .plans/README.md so the wiki can never carry a stale copy of it.
+    def states
+      @states ||= begin
+        section = Doc.new(@repo.read('.plans/README.md'), '.plans/README.md').section(/\AThe states\z/).to_s
+        section.lines.filter_map do |line|
+          cells = line.strip.split('|').map(&:strip)[1..].to_a
+          next unless cells.size >= 5
+          next unless (name = cells[1][/\A\*\*(.+)\*\*\z/, 1])
+
+          State.new(emoji: cells[0], name: name, key: cells[2].delete('`'),
+                    files: cells[3].scan(/`([^`]+)`/).flatten, description: cells[4])
+        end
+      end
+    end
+
+    def state_for(emoji) = states.find { |s| s.emoji == emoji }
+
+    def plans
+      @plans ||= @repo.dirs('.plans/*').filter_map do |dir|
+        base = File.basename(dir)
+        # `NNN.MM-<emoji> → slug` today; `NNN-<emoji>-slug` in older trees.
+        m = base.match(/\A(\d{3}(?:\.\d{2})?)-(\S+?)(?:\s*→\s*|-)(.+)\z/)
+        next unless m
+
+        files = @repo.glob("#{dir}/*.md").map { |f| File.basename(f) }.sort
+        Plan.new(
+          number: m[1], emoji: m[2], slug: m[3], dir: dir,
+          title: title_for(dir, m[3]), files: files, prs: prs_for(dir)
+        )
+      end.sort_by(&:number)
+    end
+
+    def by_number(num)
+      n = num.to_s
+      plans.find { |p| p.number == n } || plans.find { |p| p.number.start_with?("#{n.rjust(3, '0')}.") }
+    end
+
+    def counts = plans.group_by(&:emoji).transform_values(&:size)
+
+    private
+
+    def title_for(dir, slug)
+      %w[spec.md plan.md decisions.md].each do |f|
+        text = @repo.read("#{dir}/#{f}")
+        next unless text
+
+        title = Doc.new(text, f).title
+        return title if title
+      end
+      slug.tr('-', ' ')
+    end
+
+    # Rows of the folder's pull-requests.md, if it has one.
+    def prs_for(dir)
+      text = @repo.read("#{dir}/pull-requests.md")
+      return [] unless text
+
+      text.lines.filter_map do |line|
+        next unless line.strip.start_with?('|')
+        next if line.match?(/\A\s*\|[\s:|-]+\|\s*\z/)
+
+        cells = line.strip.split('|')[1..].to_a.map(&:strip)
+        next if cells.empty? || cells.first.match?(/\A\**(pull request|number|pr|#)?\s*\**\z/i)
+
+        cells
+      end
+    end
+  end
+
+  # GitHub Actions workflows.
+  class WorkflowScanner
+    def initialize(repo) = @repo = repo
+
+    def workflows
+      @workflows ||= @repo.glob('.github/workflows/*.{yml,yaml}').map do |path|
+        text = @repo.read(path).to_s
+        { file: path,
+          name: text[/^name:\s*(.+)$/, 1].to_s.strip.delete('"\''),
+          triggers: triggers_in(text) }
+      end
+    end
+
+    private
+
+    # The keys under `on:` (or the inline array form).
+    def triggers_in(text)
+      inline = text[/^on:\s*\[(.+)\]\s*$/, 1]
+      return inline.split(',').map(&:strip) if inline
+
+      single = text[/^on:\s*(\w+)\s*$/, 1]
+      return [single] if single
+
+      block = text[/^on:\s*\n((?:[ \t]+.*\n|\n)+)/, 1].to_s
+      block.scan(/^\s{2}(\w+):/).flatten.uniq
+    end
+  end
+
+  # `just` recipes, with the comment lines above each as its description.
+  class JustScanner
+    def initialize(repo) = @repo = repo
+
+    # The root justfile plus every `mod name 'path'` it declares.
+    #
+    # @return [Array<Array(String, String)>] module name (nil for root), path
+    def files
+      @files ||= begin
+        root = @repo.exist?('justfile') ? 'justfile' : 'Justfile'
+        mods = @repo.lines(root).filter_map do |l|
+          m = l.match(/\Amod\s+([\w-]+)\s+['"]([^'"]+)['"]/)
+          [m[1], m[2]] if m && @repo.exist?(m[2])
+        end
+        [[nil, root]] + mods
+      end
+    end
+
+    def recipes(file)
+      lines = @repo.lines(file)
+      out = []
+      lines.each_with_index do |line, i|
+        next if line.start_with?(' ', "\t", '#', '[')
+        next if lines[i - 1].to_s.match?(/\A\[private\]/) && i.positive?
+
+        m = line.chomp.match(/\A([a-z][\w-]*)([^:=\n]*):(?!=)(.*)\z/)
+        next unless m
+        next if %w[set export alias mod import].include?(m[1])
+
+        desc = []
+        j = i - 1
+        j -= 1 while j >= 0 && lines[j].start_with?('[')
+        while j >= 0 && lines[j].start_with?('#') && !lines[j].match?(/─{3}|\A#!/)
+          desc.unshift(lines[j].sub(/\A#\s?/, '').rstrip)
+          j -= 1
+        end
+        out << { name: m[1], args: m[2].to_s.strip, deps: m[3].to_s.strip,
+                 desc: desc.join(' ') }
+      end
+      out
+    end
+  end
+
+  # Cargo crates: the workspace members plus the stand-alone ones.
+  class CrateScanner
+    def initialize(repo) = @repo = repo
+
+    def crates
+      @crates ||= begin
+        ws = @repo.read('Cargo.toml').to_s
+        members = ws[/^members\s*=\s*\[(.*?)\]/m, 1].to_s.scan(/"([^"]+)"/).flatten
+        excluded = ws[/^exclude\s*=\s*\[(.*?)\]/m, 1].to_s.scan(/"([^"]+)"/).flatten
+        (members + excluded).uniq.filter_map do |dir|
+          toml = @repo.read("#{dir}/Cargo.toml")
+          next unless toml
+
+          name = toml[/^name\s*=\s*"([^"]+)"/, 1] || File.basename(dir)
+          # Declared [[bin]] targets, else Cargo's implicit ones.
+          bins = toml.scan(/\[\[bin\]\]\s*\nname\s*=\s*"([^"]+)"/).flatten
+          bins = (@repo.file?("#{dir}/src/main.rs") ? [name] : []) +
+                 @repo.glob("#{dir}/src/bin/*.rs").map { |p| File.basename(p, '.rs') } if bins.empty?
+          { dir: dir, name: name,
+            description: toml[/^description\s*=\s*"([^"]+)"/, 1].to_s,
+            bins: bins, member: members.include?(dir) }
+        end
+      end
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Page model
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # +source+ is the repo-relative document a page was lifted from, when it was.
+  Page = Struct.new(:title, :slug, :parent, :purpose, :sources, :body, :source, keyword_init: true)
+
+  module Slug
+    module_function
+
+    def call(title)
+      s = title.to_s.dup
+      s = s.gsub('&', ' and ')
+      s = s.gsub(/[–—]/, '-')
+      s = s.delete(".'`")
+      s = s.gsub(/[^\p{Alnum}\-]+/, '-')
+      s = s.squeeze('-')
+      s.sub(/\A-/, '').sub(/-\z/, '')
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The generator
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # Builds every page, then writes them out. The page hierarchy and renderers
+  # live in bin/wiki_gen/pages.rb.
+  class Generator
+    attr_reader :repo, :plans, :workflows, :just, :crates, :link_style
+
+    def initialize(root: ROOT, out: File.join(ROOT, 'wiki'), link_style: 'repo', format: true,
+                   ref: DEFAULT_REF)
+      @repo = Repo.new(root)
+      @out = out
+      @link_style = link_style
+      @format = format
+      @ref = ref
+      @plans = PlansScanner.new(@repo)
+      @workflows = WorkflowScanner.new(@repo)
+      @just = JustScanner.new(@repo)
+      @crates = CrateScanner.new(@repo)
+      @pages = []
+      @broken_links = []
+    end
+
+    def run
+      build_pages
+      write_pages
+      format!
+      report_missing_sources
+      @pages.size
+    end
+
+    # A page that links to a file which is no longer in the tree is a broken
+    # wiki. Say so on stderr rather than shipping the dead link quietly.
+    def report_missing_sources
+      missing = (@missing_sources || []).uniq
+      return if missing.empty?
+
+      warn "wiki-gen: WARNING — #{missing.size} linked path(s) do not exist in the tree:"
+      missing.sort.each { |p| warn "  #{p}" }
+      warn 'Fix the path in bin/wiki_gen/pages.rb, or restore the file.'
+    end
+
+    # Run mdformat over the output so `--check` is stable and the wiki matches
+    # the repository's markdown style. Lifted documents have their front matter
+    # stripped, so no emitted file opens with `---`; the guard stays because
+    # mdformat without mdformat-frontmatter collapses front matter into a
+    # setext heading.
+    def format!
+      return unless @format
+      return if which('mdformat').nil?
+
+      files = Dir.glob(File.join(@out, '*.md')).reject do |f|
+        File.open(f) { |io| io.gets.to_s.chomp == '---' }
+      end
+      return if files.empty?
+
+      system('mdformat', *files, out: File::NULL, err: File::NULL)
+    end
+
+    def which(cmd)
+      ENV.fetch('PATH', '').split(File::PATH_SEPARATOR)
+         .map { |dir| File.join(dir, cmd) }
+         .find { |exe| File.executable?(exe) && !File.directory?(exe) }
+    end
+
+    # ── link + block helpers ────────────────────────────────────────────────
+
+    def encode_path(path)
+      path.split('/').map { |seg| URI.encode_www_form_component(seg).gsub('+', '%20') }.join('/')
+    end
+
+    # Absolute URL of a repo path at the configured ref: `tree` for a
+    # directory, `raw` for an image (so it renders inline), `blob` otherwise.
+    def repo_url(path, image: false)
+      kind = if image then 'raw'
+             elsif @repo.directory?(path) then 'tree'
+             else 'blob'
+             end
+      "#{REPO}/#{kind}/#{@ref}/#{encode_path(path)}"
+    end
+
+    def blob = "#{REPO}/blob/#{@ref}"
+
+    # Link to a file in the repository (absolute — the wiki is a separate
+    # repo, so relative paths cannot resolve).
+    def src(path, label: nil)
+      @missing_sources ||= []
+      @missing_sources << path unless @repo.exist?(path)
+      "[`#{label || path}`](#{repo_url(@repo.exist?(path) ? @repo.canonical(path) : path)})"
+    end
+
+    # Source-list entries, silently dropping anything no longer in the tree.
+    def sources(*paths)
+      paths.flatten.compact.select { |p| @repo.exist?(p) }.map { |p| src(p) }
+    end
+
+    # Link to another wiki page.
+    def link(title, label: nil, anchor: nil)
+      slug = title_slugs.fetch(title) { Slug.call(title) }
+      target = link_style == 'wiki' ? slug : "#{slug}.md"
+      "[#{label || title}](#{target}#{anchor ? "##{anchor}" : ''})"
+    end
+
+    def page_href(page, anchor)
+      target = link_style == 'wiki' ? page.slug : "#{page.slug}.md"
+      "#{target}#{anchor ? "##{anchor}" : ''}"
+    end
+
+    def title_slugs = @pages.to_h { |p| [p.title, p.slug] }
+
+    # Canonical source path → page, for every lifted document. A directory
+    # maps to the page lifted from its README.md.
+    def pages_by_source
+      @pages.select(&:source).to_h { |p| [@repo.canonical(p.source), p] }
+    end
+
+    # Resolve a relative link found in +from+ (a repo-relative document) to
+    # the repo-relative path it names, or nil if it escapes the repository.
+    def resolve(href, from:)
+      base = href.start_with?('/') ? @repo.root : File.join(@repo.root, File.dirname(from))
+      decoded = href.delete_prefix('/').b.gsub(/%(\h\h)/n) { [Regexp.last_match(1).hex].pack('C') }
+                    .force_encoding(Encoding::UTF_8)
+      abs = File.expand_path(decoded, base)
+      root = File.expand_path(@repo.root)
+      return nil unless abs == root || abs.start_with?("#{root}/")
+
+      abs.delete_prefix(root).delete_prefix('/')
+    end
+
+    # Rewrite every relative link and image in +md+ (lifted from +from+) so it
+    # resolves from the wiki: to a wiki page when the target was lifted, to the
+    # repository otherwise. A target missing from the tree is recorded for the
+    # Documentation Drift page and linked into the repository anyway.
+    def rewrite_links(md, from:)
+      by_source = pages_by_source
+      fence = nil
+      md.to_s.lines.map do |line|
+        if (m = line.match(/\A\s{0,3}(`{3,}|~{3,})/))
+          if fence.nil? then fence = m[1][0]
+          elsif m[1][0] == fence then fence = nil
+          end
+          next line
+        end
+        next line if fence
+
+        line = line.gsub(/(!?)\]\(<?([^)\s>]+)>?((?:\s+"[^"]*")?)\)/) do
+          bang, href, title = Regexp.last_match.captures
+          "#{bang}](#{rewrite_href(href, from: from, image: bang == '!', by_source: by_source)}#{title})"
+        end
+        line.sub(/\A(\s{0,3}\[[^\]]+\]:\s+)(\S+)/) do
+          "#{Regexp.last_match(1)}#{rewrite_href(Regexp.last_match(2), from: from, by_source: by_source)}"
+        end
+      end.join
+    end
+
+    def rewrite_href(href, from:, image: false, by_source: pages_by_source)
+      return href if href.match?(%r{\A([a-z][a-z0-9+.-]*:|#|//)}i)
+
+      path, anchor = href.split('#', 2)
+      return href if path.to_s.empty?
+
+      target = resolve(path, from: from)
+      return href unless target
+
+      unless @repo.exist?(target)
+        @broken_links << [from, href]
+        return repo_url(target, image: image)
+      end
+
+      canonical = @repo.canonical(target)
+      page = by_source[canonical]
+      page ||= by_source[@repo.canonical(File.join(target, 'README.md'))] if @repo.directory?(target)
+      return page_href(page, anchor) if page && !image
+
+      "#{repo_url(canonical, image: image)}#{anchor ? "##{anchor}" : ''}"
+    end
+
+    def doc(path) = Doc.new(@repo.read(path), path)
+
+    # A markdown table.
+    def table(headers, rows, align: nil)
+      return "_None found._\n" if rows.empty?
+
+      sep = align || Array.new(headers.size, '---')
+      out = +"| #{headers.join(' | ')} |\n| #{sep.join(' | ')} |\n"
+      rows.each { |r| out << "| #{r.map { |c| c.to_s.empty? ? '—' : c }.join(' | ')} |\n" }
+      out
+    end
+
+    def quote(md)
+      return '' if md.nil?
+
+      md.lines.map { |l| l.strip.empty? ? ">\n" : "> #{l}" }.join
+    end
+
+    # Placeholder for a lifted block. Links can only be rewritten once every
+    # page exists (a link may point at a page built later), so lifting emits a
+    # token that {#resolve_lifts} expands after all pages are built.
+    def lift_token(path, md)
+      @lifts ||= []
+      @lifts << [path, md]
+      "\u0000LIFT#{@lifts.size - 1}\u0000"
+    end
+
+    def resolve_lifts
+      return unless @lifts
+
+      @pages.each do |p|
+        next unless p.body.is_a?(String)
+
+        p.body = p.body.gsub(/\u0000LIFT(\d+)\u0000/) do
+          path, md = @lifts[Regexp.last_match(1).to_i]
+          rewrite_links(md, from: path)
+        end
+      end
+    end
+
+    # A whole document, minus its front matter and title.
+    def lift_document(path, demote: 0)
+      body = doc(path).body_without_title
+      lift_token(path, Text.demote(body, by: demote))
+    end
+
+    # A named section of a document, with its own heading re-levelled.
+    def lift_section(path, pattern, level: 2, note: nil)
+      d = doc(path)
+      rx = pattern.is_a?(Regexp) ? pattern : /#{Regexp.escape(pattern)}/
+      found = d.headings.find { |(_l, t, _i)| t.match?(rx) }
+      return missing_section(path, pattern) if found.nil?
+
+      source_level, heading_title, = found
+      body = Text.demote(d.section(pattern), by: level - source_level)
+      "#{'#' * level} #{heading_title}\n\n#{lift_token(path, body)}\n\n" \
+        "<sub>Lifted verbatim from #{src(path)}#{note ? " — #{note}" : ''}.</sub>\n"
+    end
+
+    def missing_section(path, pattern)
+      "> [!WARNING]\n> The generator expected a section matching `#{pattern}` in #{src(path)} and did not " \
+        "find one — the source has been restructured. Fix the pattern in `bin/wiki_gen/pages.rb`.\n"
+    end
+
+    # ── page assembly ───────────────────────────────────────────────────────
+
+    def page(title, parent: nil, purpose: nil, sources: [], source: nil, &block)
+      slug = unique_slug(Slug.call(title))
+      pg = Page.new(title: title, slug: slug, parent: parent, purpose: purpose,
+                    sources: sources, source: source, body: block.call)
+      @pages << pg
+      pg
+    end
+
+    # GitHub Wiki page names are case-insensitive; two documents whose titles
+    # slug alike would otherwise overwrite each other silently.
+    def unique_slug(slug)
+      taken = @pages.map { |p| p.slug.downcase }.to_set
+      return slug unless taken.include?(slug.downcase)
+
+      (2..).each { |n| return "#{slug}-#{n}" unless taken.include?("#{slug}-#{n}".downcase) }
+    end
+
+    def write_pages
+      FileUtils.mkdir_p(@out)
+      Dir.glob(File.join(@out, '*.md')).each do |f|
+        File.delete(f) if File.read(f).include?(MARKER)
+      end
+      @pages.each do |p|
+        File.write(File.join(@out, "#{p.slug}.md"), Text.depersonalize(render(p)))
+      end
+      write_readme
+    end
+
+    # The folder note belongs to wiki/ in the repository. A wiki-style run is
+    # writing into the GitHub Wiki itself, where it would only be a stray page.
+    def write_readme
+      return if @link_style == 'wiki'
+
+      path = File.join(@out, 'README.md')
+      return if File.exist?(path) && !File.read(path).include?(MARKER)
+
+      File.write(path, <<~MD)
+        #{MARKER}
+
+        # Equilibris Atlas wiki (generated)
+
+        Every `.md` file in this folder is generated by #{src('bin/wiki-gen')} from the
+        repository's own documentation and source. **Do not edit them by hand** — the next
+        run overwrites the change. Edit the source the page names, then regenerate:
+
+        ```bash
+        bin/wiki-gen            # rewrite wiki/
+        bin/wiki-gen --check    # fail if wiki/ is stale (CI-friendly)
+        ```
+
+        The GitHub Wiki at <#{REPO}/wiki> is published by hand, from a clean `main`:
+
+        ```bash
+        bin/wiki-publish -n     # show what would change in the wiki
+        bin/wiki-publish        # regenerate, commit and push it
+        ```
+
+        Source links point at `#{@ref}`. Pass `--ref BRANCH` when previewing a wiki built from
+        unmerged work, or those links 404 until the branch lands.
+
+        Start at #{link('Home')}.
+      MD
+    end
+
+    # `_Sidebar` and `_Footer` are GitHub Wiki chrome, not framed pages.
+    RAW_PAGES = %w[_Sidebar _Footer].freeze
+
+    def render(p)
+      return p.body if RAW_PAGES.include?(p.slug)
+
+      out = +"#{MARKER}\n\n# #{p.title}\n\n"
+      out << "> [!NOTE]\n" \
+             "> **Generated page — do not edit by hand.** Produced by " \
+             "[`bin/wiki-gen`](#{blob}/bin/wiki-gen) v#{VERSION} on #{Date.today.iso8601} " \
+             "from the sources listed at the foot of this page. Edit those, then re-run the generator.\n\n"
+      out << "_#{p.purpose.to_s.gsub(/\s+/, ' ').strip}_\n\n" if p.purpose
+      out << "**Up:** #{link(p.parent)}\n\n" if p.parent
+      children = @pages.select { |c| c.parent == p.title }
+      unless children.empty?
+        out << "**In this section:** #{children.map { |c| link(c.title) }.join(' · ')}\n\n"
+      end
+      out << "______________________________________________________________________\n\n"
+      out << p.body.to_s.rstrip
+      out << "\n"
+      unless p.sources.empty?
+        out << "\n______________________________________________________________________\n\n"
+        out << "## Sources\n\nThis page was generated from:\n\n"
+        p.sources.each { |s| out << "- #{s}\n" }
+      end
+      out
+    end
+  end
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# The page hierarchy and renderers live in a separate file so this one stays
+# navigable.
+# ────────────────────────────────────────────────────────────────────────────
+require_relative 'wiki_gen/pages'
+
+if $PROGRAM_NAME == __FILE__
+  options = { out: File.join(WikiGen::ROOT, 'wiki'), link_style: 'repo', check: false, format: true,
+              ref: WikiGen::DEFAULT_REF }
+  OptionParser.new do |o|
+    o.banner = 'Usage: bin/wiki-gen [options]'
+    o.on('--out DIR', 'Output directory (default: wiki/)') { |v| options[:out] = File.expand_path(v) }
+    o.on('--link-style STYLE', %w[repo wiki], 'repo (.md links) or wiki (extension-less)') do |v|
+      options[:link_style] = v
+    end
+    o.on('--[no-]format', 'Run mdformat over the output (default: yes, when installed)') do |v|
+      options[:format] = v
+    end
+    o.on('--ref REF', "Git ref that source links point at (default: #{WikiGen::DEFAULT_REF})") do |v|
+      options[:ref] = v
+    end
+    o.on('--check', 'Regenerate into a temp dir and diff against the current output') { options[:check] = true }
+    o.on('-h', '--help') { puts o; exit 0 }
+  end.parse!
+
+  if options[:check]
+    Dir.mktmpdir('wiki-gen') do |tmp|
+      WikiGen::Generator.new(out: tmp, link_style: options[:link_style], format: options[:format],
+                             ref: options[:ref]).run
+      diff = `diff -ru #{Shellwords.escape(options[:out])} #{Shellwords.escape(tmp)} 2>&1`
+      if diff.strip.empty?
+        puts 'wiki/ is up to date.'
+        exit 0
+      end
+      puts diff
+      warn "\nwiki/ is STALE — run bin/wiki-gen"
+      exit 1
+    end
+  else
+    count = WikiGen::Generator.new(out: options[:out], link_style: options[:link_style],
+                                   format: options[:format], ref: options[:ref]).run
+    puts "Generated #{count} pages into #{options[:out]}"
+  end
+end

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# Publish the generated wiki to this repository's GitHub Wiki.
+#
+#   bin/wiki-publish             regenerate and push, when anything changed
+#   bin/wiki-publish -n          show what would change; push nothing
+#   bin/wiki-publish --ref REF   point source links at REF (default: main)
+#
+# The wiki is DERIVED (see bin/wiki-gen), and GitHub keeps it in a separate git
+# repository, `<repo>.wiki.git`. This clones that repository, regenerates
+# every page into the clone with extension-less links, and commits and pushes
+# only when the result differs from what is published. Pages the generator no
+# longer emits are removed; a page without its marker is never touched.
+#
+# It publishes from a clean `main` and refuses anything else, so unmerged work
+# cannot reach the wiki by accident. `--unmerged` lifts that, deliberately.
+#
+# The wiki repository is `origin` with `.wiki` added, unless $WIKI_REMOTE names
+# another URL. CI sets it to an https URL carrying the workflow's token.
+#
+# Needs ruby on PATH, and mdformat when the pages should match the repository's
+# Markdown style (bin/wiki-gen skips formatting without it).
+
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ref=main
+dry_run=0
+unmerged=0
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/wiki-publish [-n] [--ref REF] [--unmerged]
+
+  -n, --dry-run   clone, regenerate and show the diff; commit and push nothing
+      --ref REF   git ref that source links point at (default: main)
+      --unmerged  publish this checkout even when it is not a clean main
+  -h, --help      this text
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    -n | --dry-run) dry_run=1 ;;
+    --ref)
+      ref="${2:?--ref needs a value}"
+      shift
+      ;;
+    --unmerged) unmerged=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "wiki-publish: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if ((!dry_run && !unmerged)); then
+  branch="$(git -C "$root" symbolic-ref --quiet --short HEAD || true)"
+  if [[ "$branch" != main ]]; then
+    echo "wiki-publish: on '${branch:-a detached HEAD}', not main. Publish from main, or pass --unmerged." >&2
+    exit 1
+  fi
+  if [[ -n "$(git -C "$root" status --porcelain)" ]]; then
+    echo "wiki-publish: the working tree has uncommitted changes. Commit them, or pass --unmerged." >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "${WIKI_REMOTE:-}" ]]; then
+  remote="$WIKI_REMOTE"
+else
+  origin="$(git -C "$root" remote get-url origin)"
+  remote="${origin%.git}.wiki.git"
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+wiki="$work/wiki"
+
+if ! git clone --quiet "$remote" "$wiki" 2>/dev/null; then
+  echo "wiki-publish: cannot clone the wiki repository." >&2
+  echo "A wiki has no repository until its first page exists: create one in the Wiki tab on GitHub, then retry." >&2
+  exit 1
+fi
+
+"$root/bin/wiki-gen" --out "$wiki" --link-style wiki --ref "$ref"
+
+git -C "$wiki" add --all
+if git -C "$wiki" diff --cached --quiet; then
+  echo "wiki-publish: the wiki is up to date."
+  exit 0
+fi
+
+git -C "$wiki" diff --cached --name-status
+git -C "$wiki" diff --cached --shortstat
+
+if ((dry_run)); then
+  echo "wiki-publish: dry run, nothing committed or pushed."
+  exit 0
+fi
+
+git -C "$wiki" commit --quiet -m "Regenerate wiki from $(git -C "$root" rev-parse --short HEAD)"
+git -C "$wiki" push --quiet origin HEAD
+echo "wiki-publish: pushed."

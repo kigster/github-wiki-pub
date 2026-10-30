@@ -1,0 +1,21 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Stands in for the real gwtc: records its arguments next to the output and
+# writes $FAKE_GWTC_HTML as the document. $FAKE_GWTC_MODE=fail exits 1,
+# $FAKE_GWTC_MODE=silent exits 0 without writing anything, as gwtc does
+# when its output directory is missing.
+args = ARGV.dup
+dir = args[args.index("--output") + 1]
+name = args[args.index("--file-name") + 1]
+
+case ENV.fetch("FAKE_GWTC_MODE", "")
+when "fail"
+  $stderr.puts "gwtc: something broke" # warn is silent under RUBYOPT=-W0
+  exit 1
+when "silent"
+  exit 0
+end
+
+File.write(File.join(dir, "#{name}.args"), args.join("\n"))
+File.write(File.join(dir, "#{name}.html"), File.read(ENV.fetch("FAKE_GWTC_HTML")))
